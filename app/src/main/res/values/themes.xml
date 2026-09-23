@@ -1,0 +1,9 @@
+<resources>
+    <style name="Theme.RideChat" parent="android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#8DD9C6</item>
+        <item name="android:navigationBarColor">#10161A</item>
+        <item name="android:statusBarColor">#10161A</item>
+    </style>
+</resources>

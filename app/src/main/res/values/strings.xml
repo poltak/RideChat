@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">RideChat</string>
+    <string name="notification_channel_name">RideChat ride</string>
+    <string name="notification_channel_description">Controls for the active offline ride chat</string>
+</resources>
