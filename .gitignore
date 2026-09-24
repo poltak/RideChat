@@ -6,5 +6,7 @@ local.properties
 *.iml
 captures/
 .externalNativeBuild/
+.kotlin/
+codec-opus/.cxx/
 codec-opus/src/main/cpp/.cxx/
 codec-opus/src/main/cpp/opus-1.5.2.tar.gz
