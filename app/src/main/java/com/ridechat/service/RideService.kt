@@ -14,6 +14,7 @@ import androidx.core.app.NotificationCompat
 import com.ridechat.app.MainActivity
 import com.ridechat.app.R
 import com.ridechat.audio.AudioEngine
+import com.ridechat.audio.AudioRoutePreference
 import com.ridechat.core.AudioFrame
 import com.ridechat.transport.NearbyRide
 import com.ridechat.transport.RideState
@@ -154,6 +155,11 @@ class RideService : Service() {
 
     fun startRide() {
         startRide(fromForegroundStart = false)
+    }
+
+    fun setAudioRoutePreference(preference: AudioRoutePreference) {
+        _state.update { it.copy(routePreference = preference) }
+        audio?.setRoutePreference(preference)
     }
 
     private fun startRide(fromForegroundStart: Boolean) {
@@ -330,9 +336,12 @@ class RideService : Service() {
     private fun ensureAudio(): AudioEngine? {
         audio?.let { return it }
         return try {
-            AudioEngine(applicationContext, audioListener).also { audio = it }
+            AudioEngine(applicationContext, audioListener).also {
+                audio = it
+                it.setRoutePreference(_state.value.routePreference)
+            }
         } catch (error: Throwable) {
-            reportError(IllegalStateException("A communication headset and microphone permission are required", error))
+            reportError(IllegalStateException("Audio and microphone permission are required", error))
             null
         }
     }
@@ -430,7 +439,7 @@ class RideService : Service() {
         val count = ride.members.size
         return when {
             _state.value.microphoneSilenced -> "Microphone privacy switch · $count riders"
-            _state.value.audioState == AudioEngine.State.HEADSET_MISSING -> "Connect communication headset · $count riders"
+            _state.value.audioState == AudioEngine.State.ROUTE_UNAVAILABLE -> "Choose an available audio route · $count riders"
             _state.value.audioState == AudioEngine.State.AUDIO_INTERRUPTED -> "Audio interrupted · $count riders"
             ride.muted -> "Muted · $count riders"
             else -> "Live · $count riders"
@@ -445,6 +454,7 @@ class RideService : Service() {
         val ride: RideState = RideState(),
         val audioState: AudioEngine.State = AudioEngine.State.IDLE,
         val route: AudioEngine.RouteInfo? = null,
+        val routePreference: AudioRoutePreference = AudioRoutePreference.AUTOMATIC,
         val microphoneSilenced: Boolean = false,
         val error: String? = null,
         val status: String = "Ready",

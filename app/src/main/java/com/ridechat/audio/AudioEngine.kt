@@ -12,6 +12,7 @@ import android.media.AudioRecord
 import android.media.AudioRecordingConfiguration
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
 import android.os.Handler
 import android.os.HandlerThread
 import com.ridechat.core.AudioFrame
@@ -29,9 +30,9 @@ import kotlin.math.min
 /**
  * Audio capture, Opus encoding, and per-speaker playback for a ride session.
  *
- * The engine deliberately accepts only a communication headset route. It does not
- * fall back to the phone microphone, earpiece, or speaker when the headset goes
- * away. All blocking audio work is done on dedicated workers.
+ * The engine supports a communication headset or the built-in microphone and
+ * speaker. An active headset route never falls back to the speaker on loss.
+ * All blocking audio work is done on dedicated workers.
  */
 class AudioEngine(
     context: Context,
@@ -109,6 +110,7 @@ class AudioEngine(
     private var audioRecord: AudioRecord? = null
     @Volatile
     private var audioTrack: AudioTrack? = null
+    private var echoCanceler: AcousticEchoCanceler? = null
     private var captureFuture: java.util.concurrent.Future<*>? = null
     private var playbackFuture: java.util.concurrent.Future<*>? = null
     @Volatile
@@ -132,6 +134,7 @@ class AudioEngine(
     private var focusRequest: AudioFocusRequest? = null
     private var routeRetry: java.util.concurrent.ScheduledFuture<*>? = null
     private var desiredRoute: RouteKey? = null
+    private var routePreference = AudioRoutePreference.AUTOMATIC
     private var routeVerificationAttempts = 0
     private var streamGeneration = 0L
     private var sequence = 0L
@@ -155,6 +158,20 @@ class AudioEngine(
     /** Mute controls local capture only. Incoming audio continues while muted. */
     fun setMuted(value: Boolean) {
         postControl { setMutedOnControl(value) }
+    }
+
+    /** A route change stops both streams before opening the requested route. */
+    fun setRoutePreference(value: AudioRoutePreference) {
+        postControl {
+            if (routePreference == value) return@postControl
+            routePreference = value
+            if (sessionRunning) {
+                suspendAudio(State.ROUTE_UNAVAILABLE)
+                audioManager.clearCommunicationDevice()
+                desiredRoute = null
+                openStreamsIfPossible()
+            }
+        }
     }
 
     /**
@@ -250,7 +267,7 @@ class AudioEngine(
         audioManager.registerAudioRecordingCallback(recordingCallback, callbackHandler)
         desiredRoute = chooseInitialRoute()
         if (desiredRoute == null) {
-            setState(State.HEADSET_MISSING)
+            setState(State.ROUTE_UNAVAILABLE)
             scheduleRouteRetry()
             return
         }
@@ -278,6 +295,7 @@ class AudioEngine(
         audioManager.clearCommunicationDevice()
         desiredRoute = null
         routeVerified = false
+        listener.onRouteChanged(null)
         setState(State.IDLE)
     }
 
@@ -382,7 +400,7 @@ class AudioEngine(
         if (desiredRoute == null) {
             desiredRoute = chooseInitialRoute()
             if (desiredRoute == null) {
-                setState(State.HEADSET_MISSING)
+                setState(State.ROUTE_UNAVAILABLE)
                 scheduleRouteRetry()
             } else {
                 openStreamsIfPossible()
@@ -392,16 +410,22 @@ class AudioEngine(
         if (routeVerificationPending) {
             return
         }
-        if (device == null || !isAllowedHeadset(device)) {
+        if (device == null || !desiredRoute!!.matchesDevice(device)) {
             if (routeVerified) {
-                suspendAudio(State.HEADSET_MISSING)
+                // A route listener can deliver a queued event from the old
+                // streams after an explicit change. Check the live pair first.
+                val current = audioManager.communicationDevice
+                val record = audioRecord
+                val track = audioTrack
+                if (current != null && desiredRoute!!.matchesOutput(current) &&
+                    record != null && track != null &&
+                    routeCheck(current, record, track) == RouteCheck.VERIFIED
+                ) {
+                    return
+                }
+                suspendAudio(State.ROUTE_UNAVAILABLE)
                 scheduleRouteRetry()
             }
-            return
-        }
-        if (routeVerified && !desiredRoute!!.matches(device)) {
-            suspendAudio(State.HEADSET_MISSING)
-            scheduleRouteRetry()
             return
         }
         if (!routeVerified) {
@@ -410,16 +434,19 @@ class AudioEngine(
     }
 
     private fun chooseInitialRoute(): RouteKey? {
-        val available = audioManager.availableCommunicationDevices
-            .filter(::isAllowedOutput)
-        if (available.isEmpty()) {
-            return null
-        }
+        val available = audioManager.availableCommunicationDevices.filter { it.isSink }
+        val headsetRoutes = available.filter(::isAllowedHeadset)
+        val phoneRoute = available.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+        val phoneAvailable = phoneRoute != null && audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            .any { it.isSource && it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+        val kind = AudioRoutePolicy.select(routePreference, phoneAvailable, headsetRoutes.isNotEmpty())
+            ?: return null
+        val candidates = if (kind == AudioRouteKind.PHONE) listOfNotNull(phoneRoute) else headsetRoutes
         val preferred = config.preferredRouteAddress?.let { address ->
-            available.firstOrNull { it.address == address }
+            candidates.firstOrNull { it.address == address }
         }
-        val current = audioManager.communicationDevice.takeIf(::isAllowedOutput)
-        val selected = preferred ?: current ?: available.minByOrNull { routePriority(it) }
+        val current = audioManager.communicationDevice.takeIf { it in candidates }
+        val selected = preferred ?: current ?: candidates.minByOrNull { routePriority(it) }
         if (selected == null) {
             return null
         }
@@ -440,7 +467,7 @@ class AudioEngine(
     private fun findKnownRoute(): AudioDeviceInfo? {
         val expected = desiredRoute ?: return null
         return audioManager.availableCommunicationDevices
-            .firstOrNull { isAllowedOutput(it) && expected.matches(it) }
+            .firstOrNull { it.isSink && expected.matches(it) }
     }
 
     private fun openStreamsIfPossible() {
@@ -450,31 +477,31 @@ class AudioEngine(
         if (desiredRoute == null) {
             desiredRoute = chooseInitialRoute()
             if (desiredRoute == null) {
-                setState(State.HEADSET_MISSING)
+                setState(State.ROUTE_UNAVAILABLE)
                 scheduleRouteRetry()
                 return
             }
         }
         val route = findKnownRoute()
         if (route == null) {
-            setState(State.HEADSET_MISSING)
+            setState(State.ROUTE_UNAVAILABLE)
             scheduleRouteRetry()
             return
         }
         try {
             if (!audioManager.setCommunicationDevice(route)) {
-                setState(State.HEADSET_MISSING)
+                setState(State.ROUTE_UNAVAILABLE)
                 scheduleRouteRetry()
                 return
             }
             if (!createAudioStreams(route)) {
-                setState(State.HEADSET_MISSING)
+                setState(State.ROUTE_UNAVAILABLE)
                 scheduleRouteRetry()
                 return
             }
             // AudioRecord and AudioTrack report their actual route only after they
             // are active. No captured samples or output are allowed before both
-            // devices match the known communication headset.
+            // devices match the chosen input and output route.
             val record = audioRecord ?: return
             val track = audioTrack ?: return
             record.startRecording()
@@ -482,7 +509,7 @@ class AudioEngine(
             beginRouteVerification(route, record, track)
         } catch (error: Throwable) {
             notifyError(error)
-            suspendAudio(State.HEADSET_MISSING)
+            suspendAudio(State.ROUTE_UNAVAILABLE)
             scheduleRouteRetry()
         }
     }
@@ -552,6 +579,15 @@ class AudioEngine(
         // these preferences only help the two streams converge before verification.
         findInputDevice(route)?.let { record.setPreferredDevice(it) }
         findOutputDevice(route)?.let { track.setPreferredDevice(it) }
+        if (RouteKey.from(route).isPhone && AcousticEchoCanceler.isAvailable()) {
+            try {
+                echoCanceler = AcousticEchoCanceler.create(record.audioSessionId)
+                echoCanceler?.enabled = true
+            } catch (_: RuntimeException) {
+                echoCanceler?.release()
+                echoCanceler = null
+            }
+        }
         record.addOnRoutingChangedListener(routeListener, callbackHandler)
         track.addOnRoutingChangedListener(trackRouteListener, callbackHandler)
         audioRecord = record
@@ -561,7 +597,7 @@ class AudioEngine(
 
     private fun findInputDevice(route: AudioDeviceInfo): AudioDeviceInfo? =
         audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-            .firstOrNull { device -> device.isSource && RouteKey.from(route).matches(device) }
+            .firstOrNull { device -> device.isSource && RouteKey.from(route).matchesInput(device) }
 
     private fun findOutputDevice(route: AudioDeviceInfo): AudioDeviceInfo? =
         audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
@@ -605,7 +641,7 @@ class AudioEngine(
                 routeVerificationAttempts++
                 if (routeVerificationAttempts >= ROUTE_VERIFICATION_ATTEMPTS) {
                     routeVerificationPending = false
-                    suspendAudio(State.HEADSET_MISSING)
+                    suspendAudio(State.ROUTE_UNAVAILABLE)
                     scheduleRouteRetry()
                 } else {
                     controlExecutor.schedule(
@@ -618,7 +654,7 @@ class AudioEngine(
 
             RouteCheck.MISMATCH -> {
                 routeVerificationPending = false
-                suspendAudio(State.HEADSET_MISSING)
+                suspendAudio(State.ROUTE_UNAVAILABLE)
                 scheduleRouteRetry()
             }
         }
@@ -636,14 +672,11 @@ class AudioEngine(
         ) {
             return RouteCheck.PENDING
         }
-        if (!isAllowedInput(input) || !isAllowedOutput(output)) {
+        val route = RouteKey.from(expected)
+        if (!route.matchesInput(input) || !route.matchesOutput(output)) {
             return RouteCheck.MISMATCH
         }
-        return if (RouteKey.from(input).matches(expected) && RouteKey.from(output).matches(expected)) {
-            RouteCheck.VERIFIED
-        } else {
-            RouteCheck.MISMATCH
-        }
+        return RouteCheck.VERIFIED
     }
 
     private fun startCaptureWhenReady() {
@@ -660,13 +693,13 @@ class AudioEngine(
                 record.startRecording()
             }
             if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                suspendAudio(State.HEADSET_MISSING)
+                suspendAudio(State.ROUTE_UNAVAILABLE)
                 scheduleRouteRetry()
                 return
             }
         } catch (error: Throwable) {
             notifyError(error)
-            suspendAudio(State.HEADSET_MISSING)
+            suspendAudio(State.ROUTE_UNAVAILABLE)
             scheduleRouteRetry()
             return
         }
@@ -708,7 +741,7 @@ class AudioEngine(
                             read == AudioRecord.ERROR_DEAD_OBJECT ||
                             read == AudioRecord.ERROR_INVALID_OPERATION
                         ) {
-                            State.HEADSET_MISSING
+                            State.ROUTE_UNAVAILABLE
                         } else {
                             State.AUDIO_INTERRUPTED
                         }
@@ -781,7 +814,7 @@ class AudioEngine(
                                 written == AudioTrack.ERROR_DEAD_OBJECT ||
                                 written == AudioTrack.ERROR_INVALID_OPERATION
                             ) {
-                                State.HEADSET_MISSING
+                                State.ROUTE_UNAVAILABLE
                             } else {
                                 State.AUDIO_INTERRUPTED
                             }
@@ -873,6 +906,7 @@ class AudioEngine(
         routeVerified = false
         releaseAudioResources()
         incomingFrames.clear()
+        listener.onRouteChanged(null)
         setState(nextState)
     }
 
@@ -916,6 +950,8 @@ class AudioEngine(
         synchronized(resourceLock) {
             stopCapture()
             stopPlayback()
+            echoCanceler?.release()
+            echoCanceler = null
             audioRecord?.let { record ->
                 try {
                     record.removeOnRoutingChangedListener(routeListener)
@@ -965,7 +1001,7 @@ class AudioEngine(
                 if (desiredRoute != null) {
                     openStreamsIfPossible()
                 } else {
-                    setState(State.HEADSET_MISSING)
+                    setState(State.ROUTE_UNAVAILABLE)
                     scheduleRouteRetry()
                 }
             }
@@ -987,18 +1023,13 @@ class AudioEngine(
         }
     }
 
-    private fun isAllowedInput(device: AudioDeviceInfo?): Boolean =
-        isAllowedHeadset(device) && device!!.isSource
-
-    private fun isAllowedOutput(device: AudioDeviceInfo?): Boolean =
-        isAllowedHeadset(device) && device!!.isSink
-
     private fun routePriority(device: AudioDeviceInfo): Int = when (device.type) {
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 0
         AudioDeviceInfo.TYPE_BLE_HEADSET -> 1
         AudioDeviceInfo.TYPE_USB_HEADSET,
         AudioDeviceInfo.TYPE_USB_DEVICE -> 2
         AudioDeviceInfo.TYPE_WIRED_HEADSET -> 3
+        AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> 4
         else -> 100
     }
 
@@ -1053,7 +1084,7 @@ class AudioEngine(
         STARTING,
         ACTIVE,
         MUTED,
-        HEADSET_MISSING,
+        ROUTE_UNAVAILABLE,
         AUDIO_INTERRUPTED,
         STOPPING,
         CLOSED,
@@ -1085,9 +1116,28 @@ class AudioEngine(
         val address: String,
         val id: Int,
     ) {
+        val isPhone: Boolean get() = type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+
+        fun matchesInput(device: AudioDeviceInfo): Boolean =
+            device.isSource && if (isPhone) {
+                device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
+            } else {
+                matches(device)
+            }
+
+        fun matchesOutput(device: AudioDeviceInfo): Boolean = device.isSink && matches(device)
+
+        fun matchesDevice(device: AudioDeviceInfo): Boolean =
+            (device.isSource && matchesInput(device)) || (device.isSink && matchesOutput(device))
+
         fun matches(device: AudioDeviceInfo): Boolean {
             if (!sameRouteType(type, device.type)) {
                 return false
+            }
+            // A phone has one built-in speaker route. Android may give the
+            // communication device and routed track different IDs or addresses.
+            if (isPhone) {
+                return true
             }
             if (address.isNotEmpty() && device.address.isNotEmpty()) {
                 return address == device.address
@@ -1111,7 +1161,11 @@ class AudioEngine(
                 (expected == AudioDeviceInfo.TYPE_USB_HEADSET && actual == AudioDeviceInfo.TYPE_USB_DEVICE) ||
                 (expected == AudioDeviceInfo.TYPE_USB_DEVICE && actual == AudioDeviceInfo.TYPE_USB_HEADSET)
 
-        fun toInfo(): RouteInfo = RouteInfo(type = type, address = address, name = "communication headset")
+        fun toInfo(): RouteInfo = RouteInfo(
+            type = type,
+            address = address,
+            name = if (isPhone) "Phone mic and speaker" else "Communication headset",
+        )
 
         companion object {
             fun from(device: AudioDeviceInfo): RouteKey =

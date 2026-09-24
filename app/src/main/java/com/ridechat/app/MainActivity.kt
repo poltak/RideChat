@@ -46,6 +46,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
+import com.ridechat.audio.AudioRoutePreference
 import com.ridechat.service.RideService
 import com.ridechat.transport.Confirmation
 import com.ridechat.transport.DiscoveredPeer
@@ -188,6 +189,7 @@ class MainActivity : ComponentActivity() {
             UiCommand.ToggleMute,
             UiCommand.EndRide,
             UiCommand.Leave,
+            is UiCommand.SelectAudioRoute,
             -> viewModel.execute(command)
         }
     }
@@ -276,6 +278,7 @@ class RideViewModel(application: android.app.Application) : AndroidViewModel(app
                     ride = serviceState.ride,
                     audioState = serviceState.audioState,
                     routeName = serviceState.route?.name,
+                    routePreference = serviceState.routePreference,
                     microphoneSilenced = serviceState.microphoneSilenced,
                     serviceError = serviceState.error,
                     status = serviceState.status,
@@ -352,6 +355,7 @@ class RideViewModel(application: android.app.Application) : AndroidViewModel(app
             is UiCommand.Confirm -> current.confirm(command.endpointId, command.accepted)
             UiCommand.StartRide -> current.startRide()
             UiCommand.ToggleMute -> current.setMuted(!_state.value.ride.muted)
+            is UiCommand.SelectAudioRoute -> current.setAudioRoutePreference(command.preference)
             UiCommand.EndRide,
             UiCommand.Leave,
             -> current.endRide()
@@ -368,7 +372,8 @@ class RideViewModel(application: android.app.Application) : AndroidViewModel(app
         appendLine("phase=${_state.value.ride.phase.name}")
         appendLine("memberCount=${_state.value.ride.members.size.coerceAtMost(4)}")
         appendLine("audioState=${_state.value.audioState.name}")
-        appendLine("headsetRoutePresent=${_state.value.routeName != null}")
+        appendLine("audioRoutePreference=${_state.value.routePreference.name}")
+        appendLine("audioRoute=${_state.value.routeName ?: "none"}")
         appendLine("microphoneSilenced=${_state.value.microphoneSilenced}")
         appendLine("requiredPermissionsMissing=${_state.value.missingPermissions.size}")
         appendLine("notificationPermissionMissing=${_state.value.missingOptionalPermissions.size}")
@@ -399,6 +404,7 @@ data class UiState(
     val ride: RideState = RideState(),
     val audioState: com.ridechat.audio.AudioEngine.State = com.ridechat.audio.AudioEngine.State.IDLE,
     val routeName: String? = null,
+    val routePreference: AudioRoutePreference = AudioRoutePreference.AUTOMATIC,
     val microphoneSilenced: Boolean = false,
     val missingPermissions: List<String> = emptyList(),
     val missingOptionalPermissions: List<String> = emptyList(),
@@ -415,6 +421,7 @@ sealed interface UiCommand {
     data class Confirm(val endpointId: String, val accepted: Boolean) : UiCommand
     data object StartRide : UiCommand
     data object ToggleMute : UiCommand
+    data class SelectAudioRoute(val preference: AudioRoutePreference) : UiCommand
     data object EndRide : UiCommand
     data object Leave : UiCommand
     data object OpenPermissions : UiCommand
@@ -467,10 +474,12 @@ private fun RideChatApp(
 private fun StatusCard(state: UiState, onShareDiagnostics: () -> Unit) {
     val audioText = when {
         state.microphoneSilenced -> "Microphone privacy switch is active"
-        state.audioState == com.ridechat.audio.AudioEngine.State.HEADSET_MISSING -> "Connect a communication headset"
+        state.audioState == com.ridechat.audio.AudioEngine.State.ROUTE_UNAVAILABLE -> "Audio paused; choose phone speaker or reconnect a headset"
         state.audioState == com.ridechat.audio.AudioEngine.State.AUDIO_INTERRUPTED -> "Audio interrupted; check calls or another audio app"
-        state.routeName != null -> "Headset: ${state.routeName}"
-        else -> "Headset: not checked"
+        state.routeName != null -> "Audio: ${state.routeName}"
+        state.routePreference == AudioRoutePreference.PHONE -> "Audio: phone mic and speaker selected"
+        state.routePreference == AudioRoutePreference.HEADSET -> "Audio: headset selected"
+        else -> "Audio: automatic; headset if connected, otherwise phone"
     }
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -581,6 +590,7 @@ private fun LobbyScreen(state: UiState, onCommand: (UiCommand) -> Unit) {
     Text("Confirm the matching code before audio is allowed.")
     state.ride.pending.forEach { confirmation -> ConfirmationRow(confirmation, onCommand) }
     MemberList(state.ride.members)
+    AudioRouteControls(state, onCommand)
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
         Button(onClick = { onCommand(UiCommand.StartRide) }, modifier = Modifier.weight(1f)) { Text("Start ride") }
         OutlinedButton(onClick = { onCommand(UiCommand.Leave) }, modifier = Modifier.weight(1f)) { Text("Leave") }
@@ -604,7 +614,8 @@ private fun ConfirmationRow(confirmation: Confirmation, onCommand: (UiCommand) -
 @Composable
 private fun ActiveScreen(state: UiState, onCommand: (UiCommand) -> Unit) {
     Text(if (state.ride.phase == Phase.RECONNECTING) "Reconnecting" else "Ride active", style = MaterialTheme.typography.titleLarge)
-    Text("Keep the phone locked. Use the headset or notification controls while riding.")
+    Text("Use a headset for rides. Phone speaker is for stationary testing.")
+    AudioRouteControls(state, onCommand)
     MemberList(state.ride.members)
     Button(
         onClick = { onCommand(UiCommand.ToggleMute) },
@@ -613,6 +624,29 @@ private fun ActiveScreen(state: UiState, onCommand: (UiCommand) -> Unit) {
         Text(if (state.ride.muted) "Unmute microphone" else "Mute microphone", style = MaterialTheme.typography.titleMedium)
     }
     OutlinedButton(onClick = { onCommand(UiCommand.EndRide) }, modifier = Modifier.fillMaxWidth()) { Text("End ride") }
+}
+
+@Composable
+private fun AudioRouteControls(state: UiState, onCommand: (UiCommand) -> Unit) {
+    Text("Audio route", style = MaterialTheme.typography.titleMedium)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        listOf(
+            AudioRoutePreference.AUTOMATIC to "Auto",
+            AudioRoutePreference.PHONE to "Phone",
+            AudioRoutePreference.HEADSET to "Headset",
+        ).forEach { (preference, label) ->
+            if (state.routePreference == preference) {
+                Button(onClick = { onCommand(UiCommand.SelectAudioRoute(preference)) }, modifier = Modifier.weight(1f)) {
+                    Text(label)
+                }
+            } else {
+                OutlinedButton(onClick = { onCommand(UiCommand.SelectAudioRoute(preference)) }, modifier = Modifier.weight(1f)) {
+                    Text(label)
+                }
+            }
+        }
+    }
+    Text("Auto uses a headset when connected, or the phone mic and speaker.")
 }
 
 @Composable
